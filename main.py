@@ -6,28 +6,55 @@ import urllib.error
 import tempfile
 import os
 from urllib.parse import urlparse
-from PyQt6.QtWidgets import QApplication, QMainWindow, QGraphicsView, QGraphicsScene
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphicsScene, 
+                               QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel,
+                               QSpinBox, QDoubleSpinBox, QPushButton, QFileDialog)
 from PyQt6.QtSvgWidgets import QGraphicsSvgItem
+from PyQt6.QtSvg import QSvgGenerator
 from PyQt6.QtGui import QPixmap, QPainter, QImage, QPen, QColor
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QLineF, QSize, QRectF
 
 class ImageViewer(QMainWindow):
-    def __init__(self, file_path, num_lines=0, spacing=0.0, line_width=3, min_line_width=1.0, variation_intensity=1.0, line_color="red"):
+    def __init__(self, file_path, num_lines=50, spacing=0.0, line_width=5.0, min_line_width=1.0, variation_intensity=1.0, line_color="red"):
         super().__init__()
         self.setWindowTitle("SVG/Image Viewer - Ready for drawing")
         self.setGeometry(100, 100, 800, 600)
         
-        # A QGraphicsScene holds the items (like your background image and future line art)
-        self.scene = QGraphicsScene()
         
-        # The view displays the scene
+        # Central widget and layout for the sidebar and canvas
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QHBoxLayout(main_widget)
+        
+        # --- Sidebar ---
+        sidebar = QWidget()
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar.setFixedWidth(250)
+        
+        self.num_lines_slider = self.create_slider("Number of Lines", sidebar_layout, 10, 300, num_lines)
+        self.max_width_slider = self.create_slider("Max Width", sidebar_layout, 1, 50, int(line_width))
+        self.min_width_slider = self.create_slider("Min Width", sidebar_layout, 0, 20, int(min_line_width))
+        self.variation_slider = self.create_slider("Variation Intensity", sidebar_layout, 0, 30, int(variation_intensity * 10), is_float=True)
+        
+        # --- Export Button ---
+        self.export_button = QPushButton("Export to SVG")
+        self.export_button.clicked.connect(self.export_svg)
+        sidebar_layout.addWidget(self.export_button)
+        
+        sidebar_layout.addStretch() # Push everything to top
+        main_layout.addWidget(sidebar)
+        
+        # --- Canvas ---
+        self.scene = QGraphicsScene()
         self.view = QGraphicsView(self.scene)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        self.setCentralWidget(self.view)
+        main_layout.addWidget(self.view)
         
         self.bg_image = None
-        bg_width, bg_height = 800, 600
+        self.bg_width, self.bg_height = 800, 600
+        self.line_color = line_color
+        self.file_path = file_path # stash for resizing
+
         
         # Load the image or SVG
         _, ext = os.path.splitext(file_path.lower())
@@ -35,126 +62,190 @@ class ImageViewer(QMainWindow):
             self.item = QGraphicsSvgItem(file_path)
             self.scene.addItem(self.item)
             rect = self.item.boundingRect()
-            bg_width = rect.width()
-            bg_height = rect.height()
+            rect = self.item.boundingRect()
+            self.bg_width = rect.width()
+            self.bg_height = rect.height()
         else:
             image = QImage(file_path)
             if not image.isNull():
                 # Store the background image for pixel brightness sampling
                 self.bg_image = image.convertToFormat(QImage.Format.Format_Grayscale8)
-                bg_width = self.bg_image.width()
-                bg_height = self.bg_image.height()
-                self.scene.setSceneRect(0, 0, bg_width, bg_height)
+                self.bg_width = self.bg_image.width()
+                self.bg_height = self.bg_image.height()
+                self.scene.setSceneRect(0, 0, self.bg_width, self.bg_height)
                 # We intentionally DO NOT add the pixmap to the scene, 
                 # so the varied line widths create the illusion of the image!
             else:
                 print(f"Failed to load image: {file_path}")
                 
-        # Draw diagonal lines from bottom-left to top-right across the picture
-        if bg_width > 0 and bg_height > 0:
-            W = bg_width
-            H = bg_height
-            
-            # Determine line drawing parameters based on user input
-            if spacing > 0:
-                delta_C = spacing * math.hypot(W, H) / (W * H)
-                if num_lines <= 0:
-                    num_lines = int(2.0 / delta_C)
-            else:
-                if num_lines <= 0:
-                    num_lines = 50
-                delta_C = 2.0 / num_lines
+        # Draw the initial lines
+        self.draw_lines()
+        self.fit_view()
 
-            if num_lines > 0:
-                pen = QPen(QColor(line_color))
-                pen.setWidthF(line_width) # make the lines clearly visible
-                
-                start_i = -(num_lines - 1) / 2.0
-                for i in range(num_lines):
-                    # Evenly distribute lines across the diagonal
-                    # We map a set of parallel lines with equation: x/W + y/H = C
-                    # where C ranges from 0.0 (top-left) to 2.0 (bottom-right)
-                    if spacing > 0 and num_lines > 0:
-                        # Center the lines around C=1.0 if both parameters are explicitly provided
-                        C = 1.0 + (start_i + i) * delta_C
-                    else:
-                        # Evenly distribute the lines between C=0 and C=2 across the image
-                        C = (i + 0.5) * delta_C
-                        
-                    if C <= 0 or C >= 2:
-                        continue
-                        
-                    # find intersections of the line x/W + y/H = C with the image bounding rect [0, W] x [0, H]
-                    pts = []
-                    
-                    # Intersect with top edge (y = 0) => x/W = C => x = C * W
-                    x_top = C * W
-                    if 0 <= x_top <= W: pts.append((x_top, 0))
-                    
-                    # Intersect with bottom edge (y = H) => x/W + 1 = C => x = (C - 1) * W
-                    x_bot = (C - 1) * W
-                    if 0 <= x_bot <= W: pts.append((x_bot, H))
-                    
-                    # Intersect with left edge (x = 0) => y/H = C => y = C * H
-                    y_left = C * H
-                    if 0 <= y_left <= H: pts.append((0, y_left))
-                    
-                    # Intersect with right edge (x = W) => 1 + y/H = C => y = (C - 1) * H
-                    y_right = (C - 1) * H
-                    if 0 <= y_right <= H: pts.append((W, y_right))
-                    
-                    # Deduplicate points that land exactly on corners
-                    unique_pts = []
-                    for p in pts:
-                        if not any(abs(p[0]-up[0]) < 1e-5 and abs(p[1]-up[1]) < 1e-5 for up in unique_pts):
-                            unique_pts.append(p)
-                            
-                    # Draw clipping to bounding rect constraint
-                    if len(unique_pts) == 2:
-                        pt1 = unique_pts[0]
-                        pt2 = unique_pts[1]
-                        
-                        dx = pt2[0] - pt1[0]
-                        dy = pt2[1] - pt1[1]
-                        length = math.hypot(dx, dy)
-                        
-                        segment_length = 3.0 # Draw in 3-pixel segments to capture detail
-                        num_segments = max(1, int(length / segment_length))
-                        
-                        for step in range(num_segments):
-                            t1 = step / num_segments
-                            t2 = (step + 1) / num_segments
-                            x1 = pt1[0] + dx * t1
-                            y1 = pt1[1] + dy * t1
-                            x2 = pt1[0] + dx * t2
-                            y2 = pt1[1] + dy * t2
-                            
-                            mx = int((x1 + x2) / 2)
-                            my = int((y1 + y2) / 2)
-                            
-                            brightness = 255
-                            if self.bg_image is not None:
-                                if 0 <= mx < self.bg_image.width() and 0 <= my < self.bg_image.height():
-                                    brightness = self.bg_image.pixelColor(mx, my).red()
-                                    
-                            # Darker pixels -> thicker lines, Brighter pixels -> thinner lines
-                            factor = (255 - brightness) / 255.0
-                            
-                            # Enhance contrast using an exponent so details pop
-                            # variation_intensity controls how severely the line width scales.
-                            # When intensity is 0, factor becomes 1.0 (no variation)
-                            factor = factor ** 1.3
-                            factor = 1.0 + (factor - 1.0) * variation_intensity
-                            
-                            current_width = line_width * factor
-                            current_width = max(min_line_width, current_width) # Min width to keep paths continuous
-                            
-                            seg_pen = QPen(QColor(line_color))
-                            seg_pen.setWidthF(current_width)
-                            seg_pen.setCapStyle(Qt.PenCapStyle.FlatCap)
-                            
-                            self.scene.addLine(x1, y1, x2, y2, seg_pen)
+    def create_slider(self, label_text, layout, min_val, max_val, default_val, is_float=False):
+        row_layout = QHBoxLayout()
+        label = QLabel(label_text + ":")
+        row_layout.addWidget(label)
         
+        if is_float:
+            spin_box = QDoubleSpinBox()
+            spin_box.setMinimum(min_val / 10.0)
+            spin_box.setMaximum(max_val / 10.0)
+            spin_box.setSingleStep(0.1)
+            spin_box.setValue(default_val / 10.0)
+        else:
+            spin_box = QSpinBox()
+            spin_box.setMinimum(min_val)
+            spin_box.setMaximum(max_val)
+            spin_box.setValue(default_val)
+            
+        row_layout.addWidget(spin_box)
+        layout.addLayout(row_layout)
+        
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setMinimum(min_val)
+        slider.setMaximum(max_val)
+        slider.setValue(default_val)
+        
+        # Keep the text box and the slider synced up!
+        slider.valueChanged.connect(lambda val: spin_box.setValue(val / 10.0 if is_float else val))
+        if is_float:
+            spin_box.valueChanged.connect(lambda val: slider.setValue(int(val * 10)))
+        else:
+            spin_box.valueChanged.connect(slider.setValue)
+            
+        # Draw new lines on slider changes
+        slider.valueChanged.connect(self.draw_lines)
+        layout.addWidget(slider)
+        return slider
+
+    def draw_lines(self):
+        self.scene.clear()
+        
+        num_lines = self.num_lines_slider.value()
+        line_width = self.max_width_slider.value()
+        min_line_width = self.min_width_slider.value()
+        variation_intensity = self.variation_slider.value() / 10.0
+        
+        if self.bg_width > 0 and self.bg_height > 0:
+            W = self.bg_width
+            H = self.bg_height
+            
+            # Massive graphics optimization: draw everything natively to a single QPixmap 
+            # instead of adding hundreds of thousands of individual line segments to the QGraphicsScene
+            pixmap = QPixmap(W, H)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            
+            # Refactored to reuse logic
+            self.paint_lines(painter, W, H)
+                            
+            painter.end()
+            self.scene.addPixmap(pixmap)
+
+    def paint_lines(self, painter, W, H):
+        """Helper method that shares the same exact drawing logic for both screen and SVG export."""
+        num_lines = self.num_lines_slider.value()
+        line_width = self.max_width_slider.value()
+        min_line_width = self.min_width_slider.value()
+        variation_intensity = self.variation_slider.value() / 10.0
+        
+        if num_lines <= 0:
+            num_lines = 50
+        delta_C = 2.0 / num_lines
+
+        if num_lines > 0:
+            start_i = -(num_lines - 1) / 2.0
+            for i in range(num_lines):
+                C = (i + 0.5) * delta_C
+                    
+                if C <= 0 or C >= 2:
+                    continue
+                    
+                pts = []
+                
+                x_top = C * W
+                if 0 <= x_top <= W: pts.append((x_top, 0))
+                
+                x_bot = (C - 1) * W
+                if 0 <= x_bot <= W: pts.append((x_bot, H))
+                
+                y_left = C * H
+                if 0 <= y_left <= H: pts.append((0, y_left))
+                
+                y_right = (C - 1) * H
+                if 0 <= y_right <= H: pts.append((W, y_right))
+                
+                unique_pts = []
+                for p in pts:
+                    if not any(abs(p[0]-up[0]) < 1e-5 and abs(p[1]-up[1]) < 1e-5 for up in unique_pts):
+                        unique_pts.append(p)
+                        
+                if len(unique_pts) == 2:
+                    pt1 = unique_pts[0]
+                    pt2 = unique_pts[1]
+                    
+                    dx = pt2[0] - pt1[0]
+                    dy = pt2[1] - pt1[1]
+                    length = math.hypot(dx, dy)
+                    
+                    segment_length = 3.0 
+                    num_segments = max(1, int(length / segment_length))
+                    
+                    for step in range(num_segments):
+                        t1 = step / num_segments
+                        t2 = (step + 1) / num_segments
+                        x1 = pt1[0] + dx * t1
+                        y1 = pt1[1] + dy * t1
+                        x2 = pt1[0] + dx * t2
+                        y2 = pt1[1] + dy * t2
+                        
+                        mx = int((x1 + x2) / 2)
+                        my = int((y1 + y2) / 2)
+                        
+                        brightness = 255
+                        if self.bg_image is not None:
+                            if 0 <= mx < self.bg_image.width() and 0 <= my < self.bg_image.height():
+                                brightness = self.bg_image.pixelColor(mx, my).red()
+                                
+                        factor = (255 - brightness) / 255.0
+                        factor = factor ** 1.3
+                        factor = 1.0 + (factor - 1.0) * variation_intensity
+                        
+                        current_width = line_width * factor
+                        current_width = max(min_line_width, current_width)
+                        
+                        seg_pen = QPen(QColor(self.line_color))
+                        seg_pen.setWidthF(current_width)
+                        seg_pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+                        
+                        painter.setPen(seg_pen)
+                        painter.drawLine(QLineF(x1, y1, x2, y2))
+
+    def export_svg(self):
+        if self.bg_width <= 0 or self.bg_height <= 0:
+            return
+            
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save SVG", "line_art.svg", "SVG Files (*.svg)"
+        )
+        
+        if file_path:
+            generator = QSvgGenerator()
+            generator.setFileName(file_path)
+            generator.setSize(QSize(self.bg_width, self.bg_height))
+            generator.setViewBox(QRectF(0, 0, self.bg_width, self.bg_height))
+            generator.setTitle("Single Line Art Generate")
+            
+            painter = QPainter(generator)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            self.paint_lines(painter, self.bg_width, self.bg_height)
+            painter.end()
+            
+            print(f"Successfully exported to: {file_path}")
+
+    def fit_view(self):
         # Make the image fit to the window without distorting its aspect ratio
         if self.scene.sceneRect().width() > 0:
             self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -162,8 +253,7 @@ class ImageViewer(QMainWindow):
     def resizeEvent(self, event):
         # Keeps the image fitted when the user resizes the window
         super().resizeEvent(event)
-        if hasattr(self, 'scene') and self.scene.sceneRect().width() > 0:
-            self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.fit_view()
 
 
 def main():
